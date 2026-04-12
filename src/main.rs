@@ -21,9 +21,12 @@ use usage::AppState;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(extractor::extract_frame, usage::create_key),
+    paths(extractor::extract_frame, extractor::extract_frames, usage::create_key),
     components(schemas(
-        extractor::ExtractFrameRequest, 
+        extractor::ExtractFrameRequest,
+        extractor::ExtractFramesRequest,
+        extractor::ExtractionReport,
+        extractor::FailedTimestamp,
         usage::CreateKeyRequest, 
         usage::CreateKeyResponse
     )),
@@ -70,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The protected API routes
     let protected_routes = Router::new()
         .route("/extract-frame", post(extractor::extract_frame))
+        .route("/extract-frames", post(extractor::extract_frames))
         .layer(middleware::from_fn_with_state(state.clone(), usage::api_key_auth));
 
     // Admin routes
