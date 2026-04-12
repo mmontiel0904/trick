@@ -9,7 +9,8 @@ use axum::{
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use std::net::SocketAddr;
-use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer, timeout::TimeoutLayer};
+use std::time::Duration;
 use tracing::info;
 use utoipa::{
     openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
@@ -58,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     info!("Connecting to SQLite database at {}", db_url);
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(20)
         .connect(&db_url)
         .await?;
 
@@ -85,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024))
         .layer(CorsLayer::permissive())
+        .layer(TimeoutLayer::new(Duration::from_secs(60)))
         .layer(TraceLayer::new_for_http());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
