@@ -9,7 +9,7 @@ use axum::{
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use std::net::SocketAddr;
-use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer, timeout::TimeoutLayer};
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer, timeout::TimeoutLayer, services::ServeDir};
 use std::time::Duration;
 use tracing::info;
 use utoipa::{
@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(protected_routes)
         .merge(admin_routes)
+        .fallback_service(ServeDir::new("public"))
         // 500 MB body size limit
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024))
