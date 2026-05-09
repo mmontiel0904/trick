@@ -21,10 +21,11 @@ use usage::AppState;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(extractor::extract_frame, extractor::extract_frames, usage::create_key),
+    paths(extractor::extract_frame, extractor::extract_frames, extractor::extract_frame_url, usage::create_key),
     components(schemas(
         extractor::ExtractFrameRequest,
         extractor::ExtractFramesRequest,
+        extractor::ExtractFrameUrlRequest,
         extractor::ExtractionReport,
         extractor::FailedTimestamp,
         usage::CreateKeyRequest, 
@@ -74,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protected_routes = Router::new()
         .route("/extract-frame", post(extractor::extract_frame))
         .route("/extract-frames", post(extractor::extract_frames))
+        .route("/extract-frame-url", post(extractor::extract_frame_url))
         .layer(middleware::from_fn_with_state(state.clone(), usage::api_key_auth));
 
     // Admin routes
@@ -91,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024))
         .layer(CorsLayer::permissive())
-        .layer(TimeoutLayer::new(Duration::from_secs(60)))
+        .layer(TimeoutLayer::new(Duration::from_secs(90)))
         .layer(TraceLayer::new_for_http());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
