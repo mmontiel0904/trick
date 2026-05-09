@@ -7,11 +7,66 @@ use tempfile::Builder;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio::{fs::File, io::AsyncWriteExt, process::Command};
+use axum::Json;
 use tracing::{error, info};
 use std::process::Stdio;
 use serde::Serialize;
 use futures::stream::{self, StreamExt};
 use zip::write::SimpleFileOptions;
+
+async fn run_ffmpeg_extract(
+    temp_path: &std::path::Path,
+    seek_secs: u64,
+) -> Result<Vec<u8>, Response> {
+    let time_str = format!("{}", seek_secs);
+
+    info!("run_ffmpeg_extract: seeking to {}s in {:?}", seek_secs, temp_path);
+
+    let ffmpeg_future = Command::new("ffmpeg")
+        .arg("-ss").arg(&time_str)
+        .arg("-i").arg(temp_path.as_os_str())
+        .arg("-frames:v").arg("1")
+        .arg("-f").arg("image2")
+        .arg("-vcodec").arg("mjpeg")
+        .arg("-")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    let output_result = timeout(Duration::from_secs(55), ffmpeg_future).await;
+
+    match output_result {
+        Ok(Ok(res)) => {
+            if res.status.success() {
+                Ok(res.stdout)
+            } else {
+                let err_msg = String::from_utf8_lossy(&res.stderr).to_string();
+                error!("FFmpeg failed: {}", err_msg);
+                if err_msg.contains("Invalid data") || err_msg.contains("moov atom not found") {
+                    Err((StatusCode::UNPROCESSABLE_ENTITY,
+                         Json(serde_json::json!({"error": "seek position may exceed video duration"})))
+                        .into_response())
+                } else {
+                    Err((StatusCode::INTERNAL_SERVER_ERROR,
+                         Json(serde_json::json!({"error": format!("ffmpeg failed: {}", err_msg)})))
+                        .into_response())
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            error!("Failed to execute ffmpeg: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR,
+                 Json(serde_json::json!({"error": "ffmpeg execution failed"})))
+                .into_response())
+        }
+        Err(_) => {
+            error!("FFmpeg timed out");
+            Err((StatusCode::INTERNAL_SERVER_ERROR,
+                 Json(serde_json::json!({"error": "video processing timed out"})))
+                .into_response())
+        }
+    }
+}
 
 /// Extract a frame from a video segment
 ///
@@ -93,64 +148,16 @@ pub async fn extract_frame(mut multipart: Multipart) -> Result<impl IntoResponse
 
     let m = minute.unwrap_or(0);
     let s = second.unwrap_or(0);
-    let time_str = format!("{:02}:{:02}:{:02}", m / 60, m % 60, s); // Supports minutes > 60
+    let seek_secs = (m as u64) * 60 + (s as u64);
 
-    info!("Extracting frame at time: {} from {:?}", time_str, temp_path.to_str());
+    let jpeg_bytes = run_ffmpeg_extract(&temp_path, seek_secs).await?;
 
-    // Call ffmpeg
-    // ffmpeg -ss 00:MM:SS -i <input> -frames:v 1 -f image2 -vcodec mjpeg -
-    let ffmpeg_future = Command::new("ffmpeg")
-        .arg("-ss")
-        .arg(&time_str)
-        .arg("-i")
-        .arg(temp_path.as_os_str())
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-f")
-        .arg("image2")
-        .arg("-vcodec")
-        .arg("mjpeg")
-        .arg("-") // output to stdout
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    tokio::task::spawn_blocking(move || drop(temp_path));
 
-    let output_result = timeout(Duration::from_secs(30), ffmpeg_future).await;
+    info!("extract_frame: frame extracted successfully");
 
-    let output = match output_result {
-        Ok(Ok(res)) => res,
-        Ok(Err(e)) => {
-            error!("Failed to execute ffmpeg: {}", e);
-            tokio::task::spawn_blocking(move || drop(temp_path));
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        }
-        Err(_) => {
-            error!("FFmpeg execution timed out");
-            tokio::task::spawn_blocking(move || drop(temp_path));
-            return Err((StatusCode::REQUEST_TIMEOUT, "Video processing timed out".to_string()).into_response());
-        }
-    };
-
-    if !output.status.success() {
-        let err_msg = String::from_utf8_lossy(&output.stderr);
-        error!("FFmpeg command failed: {}", err_msg);
-        tokio::task::spawn_blocking(move || drop(temp_path));
-        return Err((StatusCode::BAD_REQUEST, format!("Video extraction failed: {}", err_msg)).into_response());
-    }
-
-    // The output.stdout contains our JPEG bytes
-    let headers = [
-        (header::CONTENT_TYPE, "image/jpeg"),
-    ];
-
-    info!("Successfully extracted frame!");
-
-    // Clean up temporary file using standard synchronous thread to unblock Tokio threads
-    tokio::task::spawn_blocking(move || {
-        drop(temp_path);
-    });
-
-    Ok((headers, output.stdout))
+    let headers = [(header::CONTENT_TYPE, "image/jpeg")];
+    Ok((headers, jpeg_bytes))
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
