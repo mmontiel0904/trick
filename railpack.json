@@ -1,5 +1,11 @@
 {
   "$schema": "https://schema.railpack.com",
+  "caches": {
+    "cargo_target": {
+      "directory": "target",
+      "type": "locked"
+    }
+  },
   "deploy": {
     "aptPackages": ["ffmpeg", "sqlite3"]
   }

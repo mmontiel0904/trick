@@ -1,5 +1,5 @@
 use axum::{
-    extract::Multipart,
+    extract::{rejection::JsonRejection, Multipart},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -14,6 +14,21 @@ use std::process::Stdio;
 use serde::Serialize;
 use futures::stream::{self, StreamExt};
 use zip::write::SimpleFileOptions;
+
+/// Standard error response body returned by all 4xx/5xx responses.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ErrorResponse {
+    /// Human-readable error message.
+    pub error: String,
+}
+
+/// Convert an Axum JSON rejection (e.g. missing field, bad JSON) into a typed
+/// 422 JSON response instead of Axum's default plain-text body.
+fn json_rejection_response(rejection: JsonRejection) -> Response {
+    let msg = rejection.body_text();
+    (StatusCode::UNPROCESSABLE_ENTITY,
+     Json(serde_json::json!({"error": msg}))).into_response()
+}
 
 async fn run_ffmpeg_extract(
     temp_path: &std::path::Path,
@@ -460,22 +475,31 @@ const MAX_VIDEO_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
         description = "Drive URL, OAuth token, and timestamp."
     ),
     responses(
-        (status = 200, description = "The extracted JPEG frame", content_type = "image/jpeg"),
-        (status = 400, description = "Bad Request — missing or invalid fields"),
-        (status = 401, description = "Unauthorized — Drive rejected the token"),
-        (status = 403, description = "Forbidden — caller lacks permission to the file"),
-        (status = 404, description = "Not Found — bad fileId or file deleted"),
-        (status = 413, description = "Payload Too Large — video exceeds 2 GB limit"),
-        (status = 422, description = "Unprocessable — seek position beyond video duration"),
-        (status = 500, description = "Internal Server Error")
+        (status = 200, description = "The extracted JPEG frame", content_type = "image/jpeg",
+         body = Vec<u8>),
+        (status = 400, description = "Bad Request — missing or invalid fields",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 401, description = "Unauthorized — Drive rejected the token",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 403, description = "Forbidden — caller lacks permission to the file",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Not Found — bad fileId or file deleted",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 413, description = "Payload Too Large — video exceeds 2 GB limit",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 422, description = "Unprocessable — seek position beyond video duration or bad JSON",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 500, description = "Internal Server Error",
+         body = ErrorResponse, content_type = "application/json")
     ),
     security(
         ("api_key" = [])
     )
 )]
 pub async fn extract_frame_url(
-    Json(body): Json<ExtractFrameUrlRequest>,
+    body: Result<Json<ExtractFrameUrlRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, Response> {
+    let Json(body) = body.map_err(json_rejection_response)?;
 
     // 1. Validate
     if body.video_url.is_empty() {
@@ -616,21 +640,31 @@ pub struct ExtractFramesUrlRequest {
         description = "Drive URL, OAuth token, and list of timestamps."
     ),
     responses(
-        (status = 200, description = "ZIP archive with JPEG frames and extraction_report.json", content_type = "application/zip"),
-        (status = 400, description = "Bad Request — missing or invalid fields"),
-        (status = 401, description = "Unauthorized — Drive rejected the token"),
-        (status = 403, description = "Forbidden — caller lacks permission to the file"),
-        (status = 404, description = "Not Found — bad fileId or file deleted"),
-        (status = 413, description = "Payload Too Large — video exceeds 2 GB limit"),
-        (status = 500, description = "Internal Server Error")
+        (status = 200, description = "ZIP archive with JPEG frames and extraction_report.json",
+         content_type = "application/zip", body = Vec<u8>),
+        (status = 400, description = "Bad Request — missing or invalid fields",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 401, description = "Unauthorized — Drive rejected the token",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 403, description = "Forbidden — caller lacks permission to the file",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Not Found — bad fileId or file deleted",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 413, description = "Payload Too Large — video exceeds 2 GB limit",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 422, description = "Unprocessable — bad JSON or too many timestamps",
+         body = ErrorResponse, content_type = "application/json"),
+        (status = 500, description = "Internal Server Error",
+         body = ErrorResponse, content_type = "application/json")
     ),
     security(
         ("api_key" = [])
     )
 )]
 pub async fn extract_frames_url(
-    Json(body): Json<ExtractFramesUrlRequest>,
+    body: Result<Json<ExtractFramesUrlRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, Response> {
+    let Json(body) = body.map_err(json_rejection_response)?;
 
     // 1. Validate
     if body.video_url.is_empty() {

@@ -29,6 +29,7 @@ use usage::AppState;
         extractor::ExtractFramesUrlRequest,
         extractor::ExtractionReport,
         extractor::FailedTimestamp,
+        extractor::ErrorResponse,
         usage::CreateKeyRequest, 
         usage::CreateKeyResponse
     )),
