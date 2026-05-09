@@ -21,11 +21,12 @@ use usage::AppState;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(extractor::extract_frame, extractor::extract_frames, extractor::extract_frame_url, usage::create_key),
+    paths(extractor::extract_frame, extractor::extract_frames, extractor::extract_frame_url, extractor::extract_frames_url, usage::create_key),
     components(schemas(
         extractor::ExtractFrameRequest,
         extractor::ExtractFramesRequest,
         extractor::ExtractFrameUrlRequest,
+        extractor::ExtractFramesUrlRequest,
         extractor::ExtractionReport,
         extractor::FailedTimestamp,
         usage::CreateKeyRequest, 
@@ -76,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/extract-frame", post(extractor::extract_frame))
         .route("/extract-frames", post(extractor::extract_frames))
         .route("/extract-frame-url", post(extractor::extract_frame_url))
+        .route("/extract-frames-url", post(extractor::extract_frames_url))
         .layer(middleware::from_fn_with_state(state.clone(), usage::api_key_auth));
 
     // Admin routes

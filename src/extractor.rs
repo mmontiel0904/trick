@@ -584,3 +584,266 @@ pub async fn extract_frame_url(
     let headers = [(header::CONTENT_TYPE, "image/jpeg")];
     Ok((headers, jpeg_bytes))
 }
+
+/// JSON body for POST /extract-frames-url
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct ExtractFramesUrlRequest {
+    /// Google Drive download URL.
+    /// Format: https://www.googleapis.com/drive/v3/files/{fileId}?alt=media
+    pub video_url: String,
+
+    /// Short-lived Google OAuth2 bearer token (from ScriptApp.getOAuthToken()).
+    /// Passed as Authorization: Bearer {token} when fetching from Drive.
+    pub access_token: String,
+
+    /// List of timestamps to extract. Supports formats: plain seconds ("90"),
+    /// MM:SS ("1:30"), or HH:MM:SS ("01:05:30"). Max 60 entries.
+    pub timestamps: Vec<String>,
+}
+
+/// Extract multiple frames from a Google Drive video URL
+///
+/// Accepts a JSON body with a Drive download URL, short-lived OAuth token,
+/// and a list of timestamps. The server fetches the video directly from Drive
+/// and extracts all frames concurrently. Returns a ZIP containing the JPEGs
+/// and an extraction_report.json describing successes and failures.
+#[utoipa::path(
+    post,
+    path = "/extract-frames-url",
+    request_body(
+        content = ExtractFramesUrlRequest,
+        content_type = "application/json",
+        description = "Drive URL, OAuth token, and list of timestamps."
+    ),
+    responses(
+        (status = 200, description = "ZIP archive with JPEG frames and extraction_report.json", content_type = "application/zip"),
+        (status = 400, description = "Bad Request — missing or invalid fields"),
+        (status = 401, description = "Unauthorized — Drive rejected the token"),
+        (status = 403, description = "Forbidden — caller lacks permission to the file"),
+        (status = 404, description = "Not Found — bad fileId or file deleted"),
+        (status = 413, description = "Payload Too Large — video exceeds 2 GB limit"),
+        (status = 500, description = "Internal Server Error")
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn extract_frames_url(
+    Json(body): Json<ExtractFramesUrlRequest>,
+) -> Result<impl IntoResponse, Response> {
+
+    // 1. Validate
+    if body.video_url.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "video_url is required"}))).into_response());
+    }
+    if body.access_token.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "access_token is required"}))).into_response());
+    }
+    if body.timestamps.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "timestamps array is required and must not be empty"}))).into_response());
+    }
+    if body.timestamps.len() > 60 {
+        return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "exceeded maximum of 60 timestamps per request"}))).into_response());
+    }
+
+    // 2. Fetch video from Drive
+    let client = Client::builder()
+        .use_rustls_tls()
+        .build()
+        .map_err(|e| {
+            error!("Failed to build HTTP client: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": "internal error"}))).into_response()
+        })?;
+
+    let resp = client
+        .get(&body.video_url)
+        .header("Authorization", format!("Bearer {}", body.access_token))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Drive fetch failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": format!("Drive fetch failed: {}", e)}))).into_response()
+        })?;
+
+    // 3. Map Drive status codes
+    match resp.status().as_u16() {
+        200 => {},
+        401 => return Err((StatusCode::UNAUTHORIZED,
+                           Json(serde_json::json!({"error": "Drive returned 401: expired or invalid token"}))).into_response()),
+        403 => return Err((StatusCode::FORBIDDEN,
+                           Json(serde_json::json!({"error": "Drive returned 403: no permission for this file"}))).into_response()),
+        404 => return Err((StatusCode::NOT_FOUND,
+                           Json(serde_json::json!({"error": "Drive returned 404: file not found"}))).into_response()),
+        s   => return Err((StatusCode::INTERNAL_SERVER_ERROR,
+                           Json(serde_json::json!({"error": format!("Drive returned unexpected status {}", s)}))).into_response()),
+    }
+
+    // 4. Size guard
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_VIDEO_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE,
+                        Json(serde_json::json!({"error": "video exceeds 2 GB server limit"}))).into_response());
+        }
+    }
+
+    // 5. Stream to temp file
+    let temp_file = Builder::new()
+        .prefix("drive-video-batch-")
+        .suffix(".tmp")
+        .tempfile()
+        .map_err(|e| {
+            error!("Failed to create tempfile: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": "internal error"}))).into_response()
+        })?;
+    let temp_path = temp_file.into_temp_path();
+
+    {
+        let mut file = File::create(&temp_path).await.map_err(|e| {
+            error!("Failed to open tempfile: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": "internal error"}))).into_response()
+        })?;
+
+        let mut stream = resp.bytes_stream();
+        let mut total: u64 = 0;
+        use futures::StreamExt as _;
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| {
+                error!("Drive stream read error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR,
+                 Json(serde_json::json!({"error": "stream read error"}))).into_response()
+            })?;
+            total += chunk.len() as u64;
+            if total > MAX_VIDEO_BYTES {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(serde_json::json!({"error": "video exceeds 2 GB server limit"}))).into_response());
+            }
+            file.write_all(&chunk).await.map_err(|e| {
+                error!("Failed to write chunk: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR,
+                 Json(serde_json::json!({"error": "internal error"}))).into_response()
+            })?;
+        }
+    } // file flushed/closed here
+
+    // 6. Concurrent ffmpeg extraction (same logic as extract_frames)
+    let temp_path_arc = std::sync::Arc::new(temp_path);
+    let mut successes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut failures: Vec<FailedTimestamp> = Vec::new();
+
+    let stream_arc = temp_path_arc.clone();
+    let mut stream = stream::iter(body.timestamps).map(move |time_str| {
+        let temp_path_ref = std::sync::Arc::clone(&stream_arc);
+        async move {
+            let ts_original = time_str.clone();
+
+            let formatted_time = if ts_original.contains(':') {
+                ts_original.clone()
+            } else if let Ok(seconds) = ts_original.parse::<u32>() {
+                format!("{:02}:{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+            } else {
+                return (ts_original, Err("Invalid timestamp format, must be seconds or MM:SS or HH:MM:SS".to_string()));
+            };
+
+            let ffmpeg_future = Command::new("ffmpeg")
+                .arg("-ss")
+                .arg(&formatted_time)
+                .arg("-i")
+                .arg(temp_path_ref.as_os_str())
+                .arg("-frames:v")
+                .arg("1")
+                .arg("-f")
+                .arg("image2")
+                .arg("-vcodec")
+                .arg("mjpeg")
+                .arg("-")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+
+            let output_result = timeout(Duration::from_secs(30), ffmpeg_future).await;
+
+            match output_result {
+                Ok(Ok(res)) => {
+                    if res.status.success() {
+                        let safe_filename = ts_original.replace(':', "-").replace('/', "_");
+                        (ts_original, Ok((safe_filename, res.stdout)))
+                    } else {
+                        let err_msg = String::from_utf8_lossy(&res.stderr);
+                        (ts_original, Err(format!("FFmpeg failed: {}", err_msg)))
+                    }
+                }
+                Ok(Err(e)) => (ts_original, Err(format!("FFmpeg execution failed: {}", e))),
+                Err(_) => (ts_original, Err("FFmpeg execution timed out".to_string())),
+            }
+        }
+    }).buffer_unordered(8);
+
+    while let Some((ts, result)) = stream.next().await {
+        match result {
+            Ok((safe_filename, bytes)) => successes.push((safe_filename, bytes)),
+            Err(reason) => failures.push(FailedTimestamp { timestamp: ts, reason }),
+        }
+    }
+
+    // 7. Assemble ZIP (same as extract_frames)
+    let zip_bytes_result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+
+        let mut report = ExtractionReport {
+            successful_timestamps: Vec::new(),
+            failed_timestamps: failures,
+        };
+        report.failed_timestamps.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        let mut zip_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut zip_buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            for (filename, jpeg_bytes) in &successes {
+                zip.start_file(format!("{}.jpg", filename), options)
+                   .map_err(|e| format!("ZIP write error: {}", e))?;
+                zip.write_all(jpeg_bytes)
+                   .map_err(|e| format!("ZIP data write error: {}", e))?;
+                report.successful_timestamps.push(filename.clone());
+            }
+
+            let report_json = serde_json::to_string_pretty(&report)
+                .map_err(|e| format!("Report serialization error: {}", e))?;
+            zip.start_file("extraction_report.json", options)
+               .map_err(|e| format!("ZIP report error: {}", e))?;
+            zip.write_all(report_json.as_bytes())
+               .map_err(|e| format!("ZIP report write error: {}", e))?;
+
+            zip.finish().map_err(|e| format!("ZIP finish error: {}", e))?;
+        }
+
+        Ok::<Vec<u8>, String>(zip_buf.into_inner())
+    }).await;
+
+    let zip_bytes = zip_bytes_result
+        .map_err(|e| {
+            error!("spawn_blocking panicked: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": "internal error"}))).into_response()
+        })?
+        .map_err(|e| {
+            error!("ZIP assembly failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": e}))).into_response()
+        })?;
+
+    info!("extract_frames_url: ZIP assembled successfully");
+
+    let headers = [(header::CONTENT_TYPE, "application/zip")];
+    Ok((headers, zip_bytes))
+}
