@@ -9,6 +9,7 @@ use tokio::time::timeout;
 use tokio::{fs::File, io::AsyncWriteExt, process::Command};
 use axum::Json;
 use tracing::{error, info};
+use reqwest::Client;
 use std::process::Stdio;
 use serde::Serialize;
 use futures::stream::{self, StreamExt};
@@ -423,4 +424,163 @@ pub struct ExtractFrameRequest {
     
     /// The second of the timestamp
     second: u32,
+}
+
+/// JSON body for POST /extract-frame-url
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct ExtractFrameUrlRequest {
+    /// Google Drive download URL.
+    /// Format: https://www.googleapis.com/drive/v3/files/{fileId}?alt=media
+    pub video_url: String,
+
+    /// Short-lived Google OAuth2 bearer token (from ScriptApp.getOAuthToken()).
+    /// Passed as Authorization: Bearer {token} when fetching from Drive.
+    pub access_token: String,
+
+    /// Minutes component of seek position (total minutes, e.g. 65 for 1h05m)
+    pub minute: u32,
+
+    /// Seconds component of seek position (0–59)
+    pub second: u32,
+}
+
+const MAX_VIDEO_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+
+/// Extract a single frame from a Google Drive video URL
+///
+/// Accepts a JSON body with a Drive download URL and short-lived OAuth token.
+/// The server fetches the video directly from Drive — the caller never holds
+/// video bytes in memory. Returns a raw JPEG frame at the requested timestamp.
+#[utoipa::path(
+    post,
+    path = "/extract-frame-url",
+    request_body(
+        content = ExtractFrameUrlRequest,
+        content_type = "application/json",
+        description = "Drive URL, OAuth token, and timestamp."
+    ),
+    responses(
+        (status = 200, description = "The extracted JPEG frame", content_type = "image/jpeg"),
+        (status = 400, description = "Bad Request — missing or invalid fields"),
+        (status = 401, description = "Unauthorized — Drive rejected the token"),
+        (status = 403, description = "Forbidden — caller lacks permission to the file"),
+        (status = 404, description = "Not Found — bad fileId or file deleted"),
+        (status = 413, description = "Payload Too Large — video exceeds 2 GB limit"),
+        (status = 422, description = "Unprocessable — seek position beyond video duration"),
+        (status = 500, description = "Internal Server Error")
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn extract_frame_url(
+    Json(body): Json<ExtractFrameUrlRequest>,
+) -> Result<impl IntoResponse, Response> {
+
+    // 1. Validate
+    if body.video_url.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "video_url is required"}))).into_response());
+    }
+    if body.access_token.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "access_token is required"}))).into_response());
+    }
+    if body.second > 59 {
+        return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "second must be 0-59"}))).into_response());
+    }
+
+    let seek_secs = body.minute as u64 * 60 + body.second as u64;
+
+    // 2. Fetch video from Drive
+    let client = Client::builder()
+        .use_rustls_tls()
+        .build()
+        .map_err(|e| {
+            error!("Failed to build HTTP client: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": "internal error"}))).into_response()
+        })?;
+
+    let resp = client
+        .get(&body.video_url)
+        .header("Authorization", format!("Bearer {}", body.access_token))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Drive fetch failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": format!("Drive fetch failed: {}", e)}))).into_response()
+        })?;
+
+    // 3. Map Drive status codes
+    match resp.status().as_u16() {
+        200 => {},
+        401 => return Err((StatusCode::UNAUTHORIZED,
+                           Json(serde_json::json!({"error": "Drive returned 401: expired or invalid token"}))).into_response()),
+        403 => return Err((StatusCode::FORBIDDEN,
+                           Json(serde_json::json!({"error": "Drive returned 403: no permission for this file"}))).into_response()),
+        404 => return Err((StatusCode::NOT_FOUND,
+                           Json(serde_json::json!({"error": "Drive returned 404: file not found"}))).into_response()),
+        s   => return Err((StatusCode::INTERNAL_SERVER_ERROR,
+                           Json(serde_json::json!({"error": format!("Drive returned unexpected status {}", s)}))).into_response()),
+    }
+
+    // 4. Check size before streaming (when Content-Length is present)
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_VIDEO_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE,
+                        Json(serde_json::json!({"error": "video exceeds 2 GB server limit"}))).into_response());
+        }
+    }
+
+    // 5. Stream to temp file
+    let temp_file = Builder::new()
+        .prefix("drive-video-")
+        .suffix(".tmp")
+        .tempfile()
+        .map_err(|e| {
+            error!("Failed to create tempfile: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": "internal error"}))).into_response()
+        })?;
+    let temp_path = temp_file.into_temp_path();
+
+    {
+        let mut file = File::create(&temp_path).await.map_err(|e| {
+            error!("Failed to open tempfile: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(serde_json::json!({"error": "internal error"}))).into_response()
+        })?;
+
+        let mut stream = resp.bytes_stream();
+        let mut total: u64 = 0;
+        use futures::StreamExt as _;
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| {
+                error!("Drive stream read error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR,
+                 Json(serde_json::json!({"error": "stream read error"}))).into_response()
+            })?;
+            total += chunk.len() as u64;
+            if total > MAX_VIDEO_BYTES {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(serde_json::json!({"error": "video exceeds 2 GB server limit"}))).into_response());
+            }
+            file.write_all(&chunk).await.map_err(|e| {
+                error!("Failed to write chunk: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR,
+                 Json(serde_json::json!({"error": "internal error"}))).into_response()
+            })?;
+        }
+    } // file flushed/closed here
+
+    // 6. Extract frame using shared helper (same logic as extract_frame)
+    let jpeg_bytes = run_ffmpeg_extract(&temp_path, seek_secs).await?;
+
+    info!("extract_frame_url: frame extracted successfully");
+
+    let headers = [(header::CONTENT_TYPE, "image/jpeg")];
+    Ok((headers, jpeg_bytes))
 }
